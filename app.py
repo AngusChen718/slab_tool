@@ -64,7 +64,6 @@ def create_download_link(data, filename, button_text, is_zip=False):
 st.markdown(
     """
     <style>
-        /* 針對分頁標題內部的按鈕進行定位和美化 */
         div.stTabs [data-testid="stMarkdownContainer"] button {
             background-color: transparent !important;
             border: none !important;
@@ -76,15 +75,11 @@ st.markdown(
             padding: 2px 5px !important;
             vertical-align: middle;
         }
-        
-        /* 滑鼠懸停在「X」上時的顏色變紅 */
         div.stTabs [data-testid="stMarkdownContainer"] button:hover {
             background-color: #FFDDDD !important;
             border-radius: 4px;
             color: #FF4B4B !important;
         }
-        
-        /* 針對選中狀態的分頁標題，讓其內部的叉叉顏色深一點 */
         div.stTabs [aria-selected="true"] button {
             color: #555555 !important;
         }
@@ -140,7 +135,7 @@ if uploaded_files:
                 dist = neighbor_list('d', slab, cutoff=1.2)
                 health_status = "✅ 正常" if len(dist) == 0 else "⚠️ 異常(原子重疊)"
                 
-                # Selective Dynamics 邏輯 (主線 A)
+                # Selective Dynamics 邏輯
                 z_positions = slab.positions[:, 2]
                 z_min, z_max = np.min(z_positions), np.max(z_positions)
                 z_range = z_max - z_min if (z_max - z_min) > 0 else 1.0
@@ -195,14 +190,12 @@ selected_indices = []
 if st.session_state.workspaces:
     st.sidebar.markdown("### 🗂️ 已載入結構清單")
     for idx, ws in enumerate(st.session_state.workspaces):
-        # 在側邊欄清單也加入叉叉關閉功能 (與 Tabs 同步)
         col_side1, col_side2 = st.sidebar.columns([0.85, 0.15])
         label = f"[{ws['health']}] {ws['name']} - ({ws['hkl']})"
         is_selected = col_side1.checkbox(label, value=True, key=f"select_side_{idx}")
         if is_selected:
             selected_indices.append(idx)
         
-        # 側邊欄的關閉按鈕
         if col_side2.button("❌", key=f"del_side_{idx}"):
             st.session_state.workspaces.pop(idx)
             st.rerun()
@@ -225,25 +218,6 @@ if st.session_state.workspaces:
 
 # --- 主畫面：分頁管理（VESTA 高階渲染 + 整合叉叉關閉功能） ---
 if st.session_state.workspaces:
-    # 🛠️ 關鍵修復：手動建構帶有「X」關閉按鈕的分頁標題
-    titles = []
-    for idx, ws in enumerate(st.session_state.workspaces):
-        hkl_label = ws['hkl']
-        # 利用 Streamlit 的 st.button 直接渲染在 Tabs 標題中
-        # 這裡用 col1 占滿空間來放置標題文字，col2 放置一個小按鈕
-        titles.append(f"{ws['name']} - ({hkl_label}) ❌")
-
-    # 渲染 Tabs
-    tabs = st.tabs(titles)
-    
-    # 由於 `st.tabs` 並不支援按鈕點擊事件，我們需要利用一個技巧來監測「哪個分頁的叉叉被點擊了」。
-    # 我們在側邊欄清單中已經整合了關閉功能，這是對 Tabs 功能的完美補充。
-    # 為了讓 Tabs「看起來」像有叉叉按鈕，我們利用 HTML/CSS 在 Tabs 標題中渲染❌。
-    # **重要說明：在目前的 Streamlit 架構下，直接點擊 Tabs 標題內的「X」文字並不能觸發後端事件**。
-    # **因此，我保留了側邊欄清單中的❌按鈕作為「關閉此分頁」的實際操作方法，這能確保程式邏輯的穩定性**。
-    # Tabs 標題中的「X」僅作為視覺指示。
-    
-    # 修改 Tabs 標題，移除視覺上的 "❌" 以免誤導 (因為原生的 tabs 不支援點擊事件)
     clean_titles = [f"{ws['name']} - ({ws['hkl']})" for ws in st.session_state.workspaces]
     tabs = st.tabs(clean_titles)
 
@@ -275,13 +249,12 @@ if st.session_state.workspaces:
             st.subheader("📊 結構資訊摘要")
             st.table(ws["summary"])
             
-            # 3. 功能按鈕 (移除原本的❌按鈕)
+            # 3. 功能按鈕
             col_act1, col_act2 = st.columns([0.5, 0.5])
             with col_act1:
                 html_link = create_download_link(ws["poscar"], ws["filename"], "📥 單獨下載此 POSCAR")
                 st.markdown(html_link, unsafe_allow_html=True)
             with col_act2:
-                # 這裡原本有❌按鈕，現在我們將關閉功能完全整合到側邊欄清單中，以實現「叉叉」關閉分頁的效果。
                 st.info("💡 提示：若要關閉此結構分頁，請點擊左側側邊欄「已載入結構清單」中該結構旁邊的❌。")
                 
 else:
