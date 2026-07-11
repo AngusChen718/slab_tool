@@ -327,43 +327,32 @@ if st.session_state.workspaces:
             c1, c2 = st.columns(2)
             show_bonds = c1.checkbox("🔗 實體金屬鍵 (Ball-and-stick)", value=True, key=f"b_{i}")
             show_box = c2.checkbox("📦 銳利晶界框線 (Unit Cell)", value=True, key=f"box_{i}")
-            
+            # --- 💎 3D 視覺化 (修復重複出框與原子隱形 Bug 版) ---
             view = py3Dmol.view(width=700, height=450)
             view.addModel(ws["poscar"], 'vasp')
             
-            # 🎨 客製化「真實金屬光澤」配色矩陣 (告別陽春灰藍色)
-            custom_colors = {
-                'Pt': '#E5E4E2',  # 鉑金高貴白金色
-                'Cu': '#D1A17B',  # 霧面金屬紅銅色
-                'Fe': '#A19D94',  # 沉穩拉絲鋼鐵灰
-                'Ni': '#D4D7D9',  # 高亮鎳金屬色
-                'Pd': '#CED4D6'   # 鈀金屬質感銀
-            }
-            
-            # 🧠 建立頂級渲染樣式，加入標誌性的邊緣高光 (Outline)，讓 3D 原子立體感爆棚
+            # 使用官方 Jmol 標準配色避免元素識別失敗，同時加入 Outline 增強 3D 立體金屬球質感
             style = {
                 'sphere': {
-                    'color': custom_colors.get(ws['name'], '#FF4B4B'), # 若非自訂元素則用 Streamlit 標誌紅
+                    'colorscheme': 'Jmol', 
                     'scale': 0.30, 
-                    'outline': {'color': '#333333', 'width': 0.04}     # 加上極細邊框，增強視覺層次
+                    'outline': {'color': '#333333', 'width': 0.04} # 保持極緻立體黑邊高光
                 }
             }
             if show_bonds: 
                 style['stick'] = {
-                    'color': '#888888',                                # 鍵結改成內斂的淺灰色，不搶金屬原子的風采
+                    'colorscheme': 'Jmol', 
                     'radius': 0.10
                 }
             view.setStyle(style)
             
             if show_box: 
-                view.addUnitCell({'color': '#444444', 'linewidth': 1.5}) # 框線調細，畫面更精緻
+                view.addUnitCell({'color': '#444444', 'linewidth': 1.5})
                 
-            view.setBackgroundColor('#F8F9FA')  # 背景改成極簡的北歐淺灰，比純白更護眼、質感更好
-            
-            # ⚙️ 注入控制參數：調低滑鼠旋轉與縮放敏感度，增加沉穩的阻尼感
-            view.setControl({'rotateSpeed': 0.6, 'zoomSpeed': 0.6}) 
-            
+            view.setBackgroundColor('#F8F9FA') # 優雅的護眼灰底
             view.zoomTo()
+            
+            # 🚀 僅使用 showmol 進行唯一一次的前端畫布渲染，徹底根絕雙圖框 Bug
             showmol(view, height=450, width=700)
             
             if show_box: 
