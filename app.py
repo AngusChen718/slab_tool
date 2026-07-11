@@ -50,9 +50,21 @@ def crystal_structure_classifier(atoms, tolerance_pct=20):
         
         # 5. 根據升級後的平均配位數進行更準確的幾何分類
         if 11.0 <= avg_cn <= 13.0:
-            # 輔助判定：利用晶格夾角進一步區分相似配位數的 FCC 與 HCP
-            angles = cell.lengths_and_angles()[3:]
-            if any(np.isclose(a, 120, atol=3) or np.isclose(a, 60, atol=3) for a in angles):
+            # 兼容新舊版 ASE：直接從 cell 矩陣計算長度與夾角
+            try:
+                # 取得三個晶格向量
+                a, b, c = cell[0], cell[1], cell[2]
+                # 計算向量長度
+                la, lb, lc = np.linalg.norm(a), np.linalg.norm(b), np.linalg.norm(c)
+                # 計算 alpha, beta, gamma 夾角 (度)
+                alpha = np.degrees(np.arccos(np.dot(b, c) / (lb * lc))) if lb*lc > 0 else 90
+                beta  = np.degrees(np.arccos(np.dot(a, c) / (la * lc))) if la*lc > 0 else 90
+                gamma = np.degrees(np.arccos(np.dot(a, b) / (la * lb))) if la*lb > 0 else 90
+                angles = [alpha, beta, gamma]
+            except Exception:
+                angles = [90, 90, 90] # 降級處理
+                
+            if any(np.isclose(a, 120, atol=4) or np.isclose(a, 60, atol=4) for a in angles):
                 return f"HCP (六方最密堆積, 平均 CN: {round(avg_cn, 2)})"
             return f"FCC (面心立方結構, 平均 CN: {round(avg_cn, 2)})"
         elif 7.0 <= avg_cn <= 9.0:
