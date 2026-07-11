@@ -331,10 +331,40 @@ if st.session_state.workspaces:
             view = py3Dmol.view(width=700, height=450)
             view.addModel(ws["poscar"], 'vasp')
             
-            style = {'sphere': {'colorscheme': 'Jmol', 'scale': 0.32}}
+            # 🎨 客製化「真實金屬光澤」配色矩陣 (告別陽春灰藍色)
+            custom_colors = {
+                'Pt': '#E5E4E2',  # 鉑金高貴白金色
+                'Cu': '#D1A17B',  # 霧面金屬紅銅色
+                'Fe': '#A19D94',  # 沉穩拉絲鋼鐵灰
+                'Ni': '#D4D7D9',  # 高亮鎳金屬色
+                'Pd': '#CED4D6'   # 鈀金屬質感銀
+            }
+            
+            # 🧠 建立頂級渲染樣式，加入標誌性的邊緣高光 (Outline)，讓 3D 原子立體感爆棚
+            style = {
+                'sphere': {
+                    'color': custom_colors.get(ws['name'], '#FF4B4B'), # 若非自訂元素則用 Streamlit 標誌紅
+                    'scale': 0.30, 
+                    'outline': {'color': '#333333', 'width': 0.04}     # 加上極細邊框，增強視覺層次
+                }
+            }
             if show_bonds: 
-                style['stick'] = {'colorscheme': 'Jmol', 'radius': 0.12}
+                style['stick'] = {
+                    'color': '#888888',                                # 鍵結改成內斂的淺灰色，不搶金屬原子的風采
+                    'radius': 0.10
+                }
             view.setStyle(style)
+            
+            if show_box: 
+                view.addUnitCell({'color': '#444444', 'linewidth': 1.5}) # 框線調細，畫面更精緻
+                
+            view.setBackgroundColor('#F8F9FA')  # 背景改成極簡的北歐淺灰，比純白更護眼、質感更好
+            
+            # ⚙️ 注入控制參數：調低滑鼠旋轉與縮放敏感度，增加沉穩的阻尼感
+            view.setControl({'rotateSpeed': 0.6, 'zoomSpeed': 0.6}) 
+            
+            view.zoomTo()
+            showmol(view, height=450, width=700)
             
             if show_box: 
                 view.addUnitCell({'color': '#222222', 'linewidth': 2})
