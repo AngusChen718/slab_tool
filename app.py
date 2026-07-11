@@ -14,30 +14,55 @@ from ase.neighborlist import neighbor_list
 if 'workspaces' not in st.session_state:
     st.session_state.workspaces = []
 
-# --- 🛠️ 晶體結構自動識別邏輯 ---
-def crystal_structure_classifier(atoms):
+# --- 🛠️ 晶體結構自動識別邏輯 (極致優化：動態共價半徑矩陣 + 容忍度控制版) ---
+def crystal_structure_classifier(atoms, tolerance_pct=20):
     try:
-        from ase.neighborlist import NeighborList
-        cutoffs = [1.6] * len(atoms)
-        nl = NeighborList(cutoffs, self_interaction=False, bothways=True, skin=0.0)
-        nl.update(atoms)
-        cn_list = [len(nl.get_neighbors(i)[0]) for i in range(len(atoms))]
-        avg_cn = np.mean(cn_list) if cn_list else 0
+        from ase.data import covalent_radii
         
-        if 11.5 <= avg_cn <= 12.5:
-            cell = atoms.get_cell()
+        n_atoms = len(atoms)
+        if n_atoms == 0:
+            return "空結構"
+            
+        # 1. 取得所有原子的共價半徑列表
+        atomic_numbers = atoms.get_atomic_numbers()
+        radii = [covalent_radii[z] for z in atomic_numbers]
+        
+        # 2. 建立動態變形容忍度係數
+        tolerance_factor = 1.0 + (tolerance_pct / 100.0)
+        
+        # 3. 利用 ASE neighbor_list 抓出週期性邊界下的所有原子對與距離
+        # 尋找可能的最大 Cutoff 作為鄰居搜尋的臨界上限
+        max_cutoff = max(radii) * 2.0 * tolerance_factor
+        first_indices, second_indices, distances = neighbor_list('ijd', atoms, cutoff=max_cutoff)
+        
+        # 4. 遍歷鄰居結果，根據兩兩原子的元素半徑動態過濾出化學鍵
+        cn_counts = np.zeros(n_atoms, dtype=int)
+        for i, j, dist in zip(first_indices, second_indices, distances):
+            if i == j and dist < 0.1:  # 排除原子自身
+                continue
+            # 關鍵優化：為每一對原子對 (i, j) 計算專屬的臨界距離
+            dynamic_cutoff = (radii[i] + radii[j]) * tolerance_factor
+            if dist <= dynamic_cutoff:
+                cn_counts[i] += 1
+                
+        avg_cn = np.mean(cn_counts) if len(cn_counts) > 0 else 0
+        cell = atoms.get_cell()
+        
+        # 5. 根據升級後的平均配位數進行更準確的幾何分類
+        if 11.0 <= avg_cn <= 13.0:
+            # 輔助判定：利用晶格夾角進一步區分相似配位數的 FCC 與 HCP
             angles = cell.lengths_and_angles()[3:]
-            if any(np.isclose(a, 120, atol=5) for a in angles):
-                return "HCP (六方最密堆積)"
-            return "FCC (面心立方結構)"
-        elif 7.5 <= avg_cn <= 8.5:
-            return "BCC (體心立方結構)"
-        elif 5.5 <= avg_cn <= 6.5:
-            return "SC (簡單立方結構)"
+            if any(np.isclose(a, 120, atol=3) or np.isclose(a, 60, atol=3) for a in angles):
+                return f"HCP (六方最密堆積, 平均 CN: {round(avg_cn, 2)})"
+            return f"FCC (面心立方結構, 平均 CN: {round(avg_cn, 2)})"
+        elif 7.0 <= avg_cn <= 9.0:
+            return f"BCC (體心立方結構, 平均 CN: {round(avg_cn, 2)})"
+        elif 5.0 <= avg_cn <= 6.5:
+            return f"SC (簡單立方結構, 平均 CN: {round(avg_cn, 2)})"
         else:
-            return "未知/複雜低對稱結構"
-    except Exception:
-        return "不確定 (請參考原始文獻)"
+            return f"低對稱或弛豫畸變結構 (平均 CN: {round(avg_cn, 2)})"
+    except Exception as e:
+        return f"識別演算法異常 ({str(e)})"
 
 # --- 🛠️ HTML 下載按鈕 ---
 def create_download_link(data, filename, button_text, is_zip=False):
@@ -113,6 +138,11 @@ fix_ratio = st.sidebar.slider("固定底部原子比例 (%)", min_value=0, max_v
 st.sidebar.caption("💡 提示：表面計算通常固定底部 40% ~ 50% 的原子以模擬內部 bulk 環境。")
 
 st.sidebar.markdown("---")
+st.sidebar.markdown("**4. 🔬 晶體識別幾何優化**")
+tolerance_pct = st.sidebar.slider("晶格變形容忍度 (%)", min_value=5, max_value=40, value=20, step=5)
+st.sidebar.caption("💡 說明：調高容忍度可避免因表面嚴重弛豫（Relaxation）或晶格形變導致的配位數誤判。")
+
+st.sidebar.markdown("---")
 
 # --- 主程式：上傳區 ---
 uploaded_files = st.file_uploader("上傳金屬 POSCAR (支援多檔案同時拖曳)", key="uploader", accept_multiple_files=True)
@@ -124,7 +154,8 @@ if uploaded_files:
                 stringio = io.StringIO(uploaded_file.getvalue().decode("utf-8"))
                 bulk = read_vasp(stringio)
                 
-                detected_lattice = crystal_structure_classifier(bulk)
+                # 呼叫升級後的動態容忍度分類器
+                detected_lattice = crystal_structure_classifier(bulk, tolerance_pct=tolerance_pct)
                 
                 # 切割與放大
                 slab = surface(bulk, (h, k, l), layers=layers, vacuum=vacuum)
