@@ -1,296 +1,376 @@
 import streamlit as st
+import py3Dmol
+import io
+import zipfile
+import base64
 import numpy as np
-import ase
-import ase.io
+import traceback
+from stmol import showmol
+from ase.io import write
+from ase.io.vasp import read_vasp
 from ase.build import surface
-import tempfile
-import os
-from io import StringIO
-import streamlit.components.v1 as components
+from ase.neighborlist import neighbor_list, natural_cutoffs
 
-st.set_page_config(
-    page_title="Slab Builder Pro",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# 初始化：存放多個工作區
+if 'workspaces' not in st.session_state:
+    st.session_state.workspaces = []
 
-# 套用高質感學術大氣暗色主題
-st.markdown("""
+# --- 🛠️ 晶體結構自動識別邏輯 (極致優化：Dynamic Cutoff + Bond Angle CNA) ---
+def crystal_structure_classifier(atoms, tolerance_pct=10):
+    try:
+        n_atoms = len(atoms)
+        if n_atoms == 0:
+            return "空結構"
+            
+        # 1. 導入 alpha 修正係數與容忍度
+        alpha = 1.15
+        tol_factor = 1.0 + (tolerance_pct / 100.0)
+        
+        # 2. 使用 ASE 官方推薦的 natural_cutoffs，給予每個原子專屬的搜尋半徑
+        cutoffs = natural_cutoffs(atoms, mult=alpha * tol_factor)
+        
+        # 3. 搜尋鄰居，大幅提升搜尋效率
+        first_indices, second_indices, distances = neighbor_list('ijd', atoms, cutoff=cutoffs)
+        
+        # 4. 利用 np.bincount 計算配位數，避免雙重計算與 i->j 偏差
+        cn_counts = np.bincount(first_indices, minlength=n_atoms)
+        avg_cn = np.mean(cn_counts) if len(cn_counts) > 0 else 0
+        
+        # 5. 根據配位數與局部幾何 (Local Geometry) 進行拓撲辨識
+        if 11.0 <= avg_cn <= 13.0:
+            # 尋找一個配位數 >= 11 的代表性原子來分析第一配位殼層鍵角
+            target_i = next((i for i, cn in enumerate(cn_counts) if cn >= 11), -1)
+            
+            if target_i != -1:
+                # 取得目標原子的所有鄰居
+                neighbors_of_i = second_indices[first_indices == target_i]
+                neighbors_of_i = [j for j in neighbors_of_i if j != target_i]
+                
+                has_109 = False
+                # 取得中心原子到所有鄰居的向量 (考慮週期性邊界 mic=True)
+                _, v_ij = atoms.get_distances(target_i, neighbors_of_i, mic=True, vector=True)
+                
+                # 計算任意兩個相鄰向量之間的夾角
+                for x in range(len(v_ij)):
+                    for y in range(x+1, len(v_ij)):
+                        v1, v2 = v_ij[x], v_ij[y]
+                        n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+                        if n1 > 0 and n2 > 0:
+                            cos_theta = np.dot(v1, v2) / (n1 * n2)
+                            cos_theta = np.clip(cos_theta, -1.0, 1.0)
+                            angle = np.degrees(np.arccos(cos_theta))
+                            
+                            # 109.5度為 HCP 的特徵鍵角 (FCC不會出現)
+                            if 105 < angle < 115:
+                                has_109 = True
+                                break
+                    if has_109:
+                        break
+                
+                if has_109:
+                    return f"HCP (六方最密堆積, 平均 CN: {round(avg_cn, 2)})"
+                else:
+                    return f"FCC (面心立方結構, 平均 CN: {round(avg_cn, 2)})"
+            else:
+                return f"密集堆積 (平均 CN: {round(avg_cn, 2)})"
+        elif 7.0 <= avg_cn <= 9.0:
+            return f"BCC (體心立方結構, 平均 CN: {round(avg_cn, 2)})"
+        elif 5.0 <= avg_cn <= 6.5:
+            return f"SC (簡單立方結構, 平均 CN: {round(avg_cn, 2)})"
+        else:
+            return f"低對稱或弛豫畸變結構 (平均 CN: {round(avg_cn, 2)})"
+            
+    except Exception as e:
+        traceback.print_exc() # 將錯誤印在後台以便 Debug
+        return f"識別演算法異常 ({str(e)})"
+
+# --- 🛠️ HTML 下載按鈕 ---
+def create_download_link(data, filename, button_text, is_zip=False):
+    if is_zip:
+        b64 = base64.b64encode(data).decode()
+        mime = "application/zip"
+    else:
+        b64 = base64.b64encode(data.encode('utf-8')).decode()
+        mime = "text/plain"
+    
+    css = """
     <style>
-        .main {
-            background-color: #0f172a;
-            color: #f8fafc;
+    .custom-dl-btn {
+        background-color: #FF4B4B; color: white; padding: 0.5rem 1rem;
+        border-radius: 0.5rem; text-decoration: none; display: inline-block;
+        font-weight: 500; margin-top: 10px; text-align: center; width: 90%;
+    }
+    .custom-dl-btn:hover { background-color: #FF6666; color: white; }
+    </style>
+    """
+    return f'{css}<a href="data:{mime};base64,{b64}" download="{filename}" class="custom-dl-btn">{button_text}</a>'
+
+# --- 🛠️ 注入 CSS 讓分頁中的「X」按鈕變好看 ---
+st.markdown(
+    """
+    <style>
+        div.stTabs [data-testid="stMarkdownContainer"] button {
+            background-color: transparent !important;
+            border: none !important;
+            color: #AAAAAA !important;
+            cursor: pointer;
+            font-size: 14px !important;
+            font-weight: normal !important;
+            margin-left: 8px !important;
+            padding: 2px 5px !important;
+            vertical-align: middle;
         }
-        .stSidebar {
-            background-color: #1e293b !important;
-            border-right: 1px solid #334155;
+        div.stTabs [data-testid="stMarkdownContainer"] button:hover {
+            background-color: #FFDDDD !important;
+            border-radius: 4px;
+            color: #FF4B4B !important;
         }
-        .css-1d391kg {
-            background-color: #1e293b !important;
-        }
-        h1, h2, h3 {
-            color: #38bdf8 !important;
-            font-family: 'Noto Sans TC', sans-serif;
-        }
-        .metric-card {
-            background-color: #1e293b;
-            border: 1px solid #334155;
-            padding: 20px;
-            border-radius: 12px;
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-            margin-bottom: 15px;
-        }
-        .metric-value {
-            font-size: 24px;
-            font-weight: bold;
-            color: #38bdf8;
-        }
-        .metric-label {
-            font-size: 14px;
-            color: #94a3b8;
+        div.stTabs [aria-selected="true"] button {
+            color: #555555 !important;
         }
     </style>
-""", unsafe_allow_html=True)
-
-st.sidebar.markdown("# ⚙️ 參數設定區")
-
-# 1. 檔案上傳區（徹底拔除 type 限制，確保無副檔名的純 POSCAR 也能在所有作業系統順暢選取）
-uploaded_file = st.sidebar.file_uploader(
-    "1. 上傳 Bulk POSCAR / CIF",
-    help="支援無副檔名 POSCAR 檔或標籤標準格式。瀏覽器不會強制進行副檔名過濾。"
+    """,
+    unsafe_allow_html=True,
 )
 
-st.sidebar.markdown("---")
+st.title("Slab Builder 研究室版 (VESTA 批次管理版) 🔬")
 
-# 2. 晶面指數與厚度設定
-st.sidebar.markdown("### 2. 晶面定義 (Miller Index)")
-col_h, col_k, col_l = st.sidebar.columns(3)
-with col_h:
-    h = int(st.sidebar.number_input("h", value=1, step=1))
-with col_k:
-    k = int(st.sidebar.number_input("k", value=1, step=1))
-with col_l:
-    l = int(st.sidebar.number_input("l", value=1, step=1))
+# --- 側邊欄：參數設定 ---
+st.sidebar.header("⚙️ 參數設定")
+st.sidebar.markdown("**1. 晶面 (h, k, l)**")
+col1, col2, col3 = st.sidebar.columns(3)
+h = col1.number_input("h", value=1, step=1)
+k = col2.number_input("k", value=1, step=1)
+l = col3.number_input("l", value=1, step=1)
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 3. 幾何規格設定")
-layers = int(st.sidebar.number_input("Slab 原子層數 (Layers)", value=4, min_value=1, step=1))
-vacuum = st.sidebar.slider("真空層厚度 (Vacuum, Å)", min_value=5.0, max_value=30.0, value=15.0, step=0.5)
-
-st.sidebar.markdown("### 4. 擴張表面積 (Supercell)")
-col_sx, col_sy = st.sidebar.columns(2)
-with col_sx:
-    super_x = int(st.sidebar.number_input("X 倍數", value=3, min_value=1, step=1))
-with col_sy:
-    super_y = int(st.sidebar.number_input("Y 倍數", value=3, min_value=1, step=1))
+layers = st.sidebar.number_input("Slab 層數 (Layers)", value=10, min_value=1)
+vacuum = st.sidebar.number_input("真空層厚度 (Vacuum)", value=15.00, min_value=0.0)
 
 st.sidebar.markdown("---")
-# 4. Selective Dynamics 約束設定
-st.sidebar.markdown("### 5. 表面計算優化設定")
+st.sidebar.markdown("**2. 擴張表面積 (Supercell)**")
+col_s1, col_s2 = st.sidebar.columns(2)
+super_x = col_s1.number_input("X 倍數", value=3, min_value=1)
+super_y = col_s2.number_input("Y 倍數", value=3, min_value=1)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("**3. 🚀 表面計算優化設定**")
 fix_ratio = st.sidebar.slider("固定底部原子比例 (%)", min_value=0, max_value=100, value=40, step=5)
-st.sidebar.info("💡 提示：鎖定底部原子以模擬塊材（Bulk）環境，能加速 VASP 收斂。")
+st.sidebar.caption("💡 提示：表面計算通常固定底部 40% ~ 50% 的原子以模擬內部 bulk 環境。")
 
-def process_slab(bulk_atoms, h, k, l, layers, vacuum, super_x, super_y, fix_ratio):
-    """
-    執行表面切削流水線。
-    為了解決「多層真空分離 (千層派 Bug)」，在此我們採用無真空幾何緊密疊加，
-    最後一步才動態調整晶胞 Z 軸高度並施加置中真空。
-    """
-    # 1. 緊密切削：不傳入任何 vacuum 參數，確保切出的 slab 原子間距 100% 維持真實金屬鍵距離
-    slab = surface(bulk_atoms, (h, k, l), layers=layers, vacuum=None)
-    
-    # 2. 超晶胞二維擴張：Z 軸保持 1 倍，避免重複堆疊
-    if super_x > 1 or super_y > 1:
-        slab = slab * (super_x, super_y, 1)
+st.sidebar.markdown("---")
+st.sidebar.markdown("**4. 🔬 晶體識別幾何優化**")
+tolerance_pct = st.sidebar.slider("晶格變形容忍度 (%)", min_value=5, max_value=20, value=10, step=1)
+st.sidebar.caption("💡 說明：配合動態矩陣 α=1.15，預設 10% 已能精準捕捉第一殼層，過高易誤納第二殼層。")
+
+st.sidebar.markdown("---")
+
+# --- 主程式：上傳區 ---
+uploaded_files = st.file_uploader("上傳金屬 POSCAR (支援多檔案同時拖曳)", key="uploader", accept_multiple_files=True)
+
+if uploaded_files:
+    if st.button("➕ 批次新增到工作區", type="primary"):
+        for uploaded_file in uploaded_files:
+            try:
+                stringio = io.StringIO(uploaded_file.getvalue().decode("utf-8"))
+                bulk = read_vasp(stringio)
+                
+                # 呼叫升級後的動態容忍度分類器
+                detected_lattice = crystal_structure_classifier(bulk, tolerance_pct=tolerance_pct)
+                
+                # 切割與放大
+                slab = surface(bulk, (h, k, l), layers=layers, vacuum=vacuum)
+                if super_x > 1 or super_y > 1: slab = slab * (super_x, super_y, 1)
+                slab.wrap()
+                
+                # --- 結構體檢優化：距離 < 0.6*(Ri+Rj) 視為重疊 ---
+                overlap_cutoffs = natural_cutoffs(slab, mult=0.6)
+                i_over, j_over, d_over = neighbor_list('ijd', slab, cutoff=overlap_cutoffs)
+                overlaps = [dist for idx_i, idx_j, dist in zip(i_over, j_over, d_over) if idx_i != idx_j]
+                health_status = "✅ 正常" if len(overlaps) == 0 else "⚠️ 異常(原子重疊)"
+                
+                # Selective Dynamics 邏輯
+                z_positions = slab.positions[:, 2]
+                z_min, z_max = np.min(z_positions), np.max(z_positions)
+                z_range = z_max - z_min if (z_max - z_min) > 0 else 1.0
+                
+                flags = []
+                for pos in slab.positions:
+                    relative_height = (pos[2] - z_min) / z_range * 100
+                    if relative_height <= fix_ratio:
+                        flags.append([False, False, False]) # Fixed
+                    else:
+                        flags.append([True, True, True])   # Relaxed
+                
+                from ase.constraints import FixAtoms
+                fixed_indices = [idx for idx, flag in enumerate(flags) if not flag[0]]
+                slab.set_constraint(FixAtoms(indices=fixed_indices))
+                
+                out_buffer = io.StringIO()
+                write(out_buffer, slab, format="vasp", vasp5=True)
+                poscar_data = out_buffer.getvalue()
+                
+                import datetime
+                current_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                
+                # 1. 嚴格依照 PDF 第 8 頁格式
+                info_content = f"""Input file: {uploaded_file.name}
+Miller index: ({h}, {k}, {l})
+Layers: {layers}
+Vacuum: {vacuum} Å
+Supercell: {super_x} x {super_y} x 1
+Output file: POSCAR
+Generated by: Streamlit Slab Builder
+Package: ASE
+Date: {current_date}
+"""
+
+                # 2. 說明生成結果與體檢報告
+                log_content = f"""[LOG] Slab Generation Workflow
+--------------------------------------------------
+本結果由網頁端工具自動化流水線產生。
+1. 讀取原始結構: {uploaded_file.name}
+   - 晶體結構體檢: {detected_lattice}
+2. 切割晶面: 沿著 ({h}, {k}, {l}) 方向，厚度為 {layers} 層。
+3. 增加真空層: 於 z 軸方向加入 {vacuum} Å 真空層。
+4. 擴張表面積: 建立 {super_x}x{super_y}x1 Supercell。
+5. Selective Dynamics (底層固定):
+   - 固定底部 {fix_ratio}% 的原子以模擬 bulk 內部。
+6. 結構異常檢查: {health_status}。
+--------------------------------------------------
+"""
+                
+                # --- 幾何物理計算優化 ---
+                # 表面積改為向量叉積 (支援非正交晶胞)
+                cross_prod = np.cross(slab.cell[0], slab.cell[1])
+                true_area = np.linalg.norm(cross_prod)
+                
+                # 真空比例改為真實物理真空空間
+                total_height = slab.cell[2,2] if slab.cell[2,2] > 0 else np.linalg.norm(slab.cell[2])
+                slab_thickness = z_max - z_min
+                actual_vacuum = total_height - slab_thickness
+                vacuum_ratio = (actual_vacuum / total_height) * 100 if total_height > 0 else 0
+                
+                num_fixed = len(fixed_indices)
+                num_relaxed = len(slab) - num_fixed
+                
+                summary = {
+                    "原始晶體結構": detected_lattice,
+                    "晶面 (hkl)": f"({h}, {k}, {l})",
+                    "層數": layers,
+                    "Supercell": f"{super_x}x{super_y}x1",
+                    "原子總數": f"{len(slab)} (固定: {num_fixed} / 放鬆: {num_relaxed})",
+                    "表面積": f"{round(true_area, 2)} Å²",
+                    "真空層佔比": f"{round(vacuum_ratio, 1)}% ({round(actual_vacuum, 2)} Å)"
+                }
+                
+                new_ws = {
+                    "name": uploaded_file.name.split('.')[0],
+                    "filename": f"POSCAR_{uploaded_file.name.split('.')[0]}_{h}{k}{l}",
+                    "poscar": poscar_data,
+                    "info_txt": info_content,  
+                    "log_txt": log_content,    
+                    "summary": summary,
+                    "health": health_status,
+                    "hkl": f"{h}{k}{l}"
+                }
+                st.session_state.workspaces.append(new_ws)
+            except Exception as e:
+                traceback.print_exc()
+                st.sidebar.error(f"檔案 {uploaded_file.name} 處理失敗: {e}")
+        st.rerun()
+
+# --- 側邊欄：🗂️ 已載入結構清單 ---
+selected_indices = []
+if st.session_state.workspaces:
+    st.sidebar.markdown("### 🗂️ 已載入結構清單")
+    for idx, ws in enumerate(st.session_state.workspaces):
+        col_side1, col_side2 = st.sidebar.columns([0.85, 0.15])
+        label = f"[{ws['health']}] {ws['name']} - ({ws['hkl']})"
+        is_selected = col_side1.checkbox(label, value=True, key=f"select_side_{idx}")
+        if is_selected:
+            selected_indices.append(idx)
         
-    # 3. 邊界碎屑物理補正：集體微調 Z 軸座標，避開 Z=0 的臨界折返面
-    slab.positions[:, 2] += 1.0
-    
-    # 4. 全局真空置中加載：
-    # 利用 ASE 的 center 函式。將 vacuum 設為設定值的一半，
-    # 這樣 ASE 會將 Z 軸邊界自動擴增為「實際厚度 + 2 * (vacuum/2)」，實現 Z 軸朝上完美真空。
-    slab.center(vacuum=vacuum / 2.0, axis=2)
-    slab.wrap()
-    
-    # 5. 施加 Selective Dynamics 鎖定標記 (標註 T T T / F F F)
-    # 根據 Z 座標由低到高排序，決定鎖定對象
-    z_coords = slab.positions[:, 2]
-    min_z, max_z = np.min(z_coords), np.max(z_coords)
-    threshold = min_z + (max_z - min_z) * (fix_ratio / 100.0)
-    
-    # 建立 constraints 陣列
-    constraints = []
-    for pos in slab.positions:
-        if pos[2] <= threshold:
-            constraints.append([False, False, False]) # 固定 (F F F)
-        else:
-            constraints.append([True, True, True])    # 自由 (T T T)
+        if col_side2.button("❌", key=f"del_side_{idx}"):
+            st.session_state.workspaces.pop(idx)
+            st.rerun()
             
-    return slab, constraints
-
-st.title("🧪 Slab Builder Pro <span style='font-size:16px; color:#94a3b8;'>v2.1 (Active Development Mode)</span>", unsafe_allow_html=True)
-st.write("材料表面前處理與幾何合規體檢中繼站。已整合 macOS 無副檔名 POSCAR 直接上傳支援與 VESTA 級 3D 週期性渲染。")
-
-if uploaded_file is not None:
-    # 取得原始檔名與內容
-    filename = uploaded_file.name
-    file_bytes = uploaded_file.getvalue()
+    st.sidebar.markdown(" ")
+    if selected_indices:
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for idx in selected_indices:
+                ws = st.session_state.workspaces[idx]
+                folder_name = f"{ws['name']}_{ws['hkl']}_output/"
+                
+                zip_file.writestr(f"{folder_name}POSCAR", ws["poscar"])
+                zip_file.writestr(f"{folder_name}slab_info.txt", ws["info_txt"])
+                zip_file.writestr(f"{folder_name}README_or_log.txt", ws["log_txt"])
+        
+        html_link = create_download_link(zip_buffer.getvalue(), "batch_slab_outputs.zip", "📦 批次下載合規資料夾 (ZIP)", is_zip=True)
+        st.sidebar.markdown(html_link, unsafe_allow_html=True)
+        st.sidebar.markdown(" ")
     
-    # 建立臨時檔以便交給 ASE 解析
-    with tempfile.NamedTemporaryFile(delete=False, suffix="_bulk") as temp:
-        temp.write(file_bytes)
-        temp_path = temp.name
-        
-    try:
-        # 自動分流讀取
-        content_preview = file_bytes.decode("utf-8", errors="ignore")
-        if "data_" in content_preview or filename.lower().endswith(".cif"):
-            bulk = ase.io.read(temp_path, format="cif")
-            st.success(f"✅ CIF 檔案載入成功！(晶胞包含 {len(bulk)} 個原子)")
-        else:
-            # 預設為 VASP POSCAR
-            bulk = ase.io.read(temp_path, format="vasp")
-            st.success(f"✅ POSCAR 檔案載入成功！(晶胞包含 {len(bulk)} 個原子)")
-            
-        os.unlink(temp_path)
-        
-        # 執行核心切片計算
-        slab, constraints = process_slab(bulk, h, k, l, layers, vacuum, super_x, super_y, fix_ratio)
-        
-        # 利用 ASE 原生寫入 CIF 至 StringIO，確保晶格參數、對稱性完整保留，從根源消滅 XYZ 碎裂 Bug
-        cif_io = StringIO()
-        ase.io.write(cif_io, slab, format="cif")
-        cif_data = cif_io.getvalue()
-        
-        st.subheader("👀 互動式 3D 原子結構體檢 (VESTA-like Viewer)")
-        st.write("已全面升級為 CIF 單元通訊協議，具備原生晶胞外框 (Cell Box) 與 PBC 週期性正確鍵結判定。")
-        
-        py3dmol_html = f"""
-        <div id="viewer_container" style="height: 500px; width: 100%; background-color: #0b0f19; border-radius: 12px; border: 1px solid #334155; position: relative;"></div>
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
-        <script src="https://3dmol.org/build/3Dmol-min.js"></script>
-        <script>
-            $(document).ready(function() {{
-                let element = $('#viewer_container');
-                let config = {{ backgroundColor: '#0b0f19' }};
-                let viewer = $3Dmol.createViewer(element, config);
-                
-                // 載入具備晶格矩陣的 CIF 格式資料
-                viewer.addModel(`{cif_data}`, "cif");
-                
-                // 設定高擬真原子球與棒狀金屬鍵樣式
-                viewer.setStyle({{}}, {{
-                    sphere: {{ scale: 0.28, colorscheme: 'rasmol' }},
-                    stick: {{ radius: 0.08, colorscheme: 'rasmol' }}
-                }});
-                
-                // 自動繪製完美對齊的 12 條晶界框線 (Crystalline Box)
-                viewer.addUnitCell();
-                
-                viewer.zoomTo();
-                viewer.render();
-            }});
-        </script>
-        """
-        components.html(py3dmol_html, height=520)
-        
-        st.subheader("📊 結構體檢與合規摘要")
-        
-        # 嚴格的三維向量叉積表面積計算 (適配所有非正交、斜方及六方晶系)
-        cell = slab.get_cell()
-        area = np.linalg.norm(np.cross(cell[0], cell[1]))
-        total_atoms = len(slab)
-        fixed_count = sum([1 for c in constraints if c == [False, False, False]])
-        
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-label">總原子數 (Total Atoms)</div>
-                    <div class="metric-value">{total_atoms}</div>
-                </div>
-            """, unsafe_allow_html=True)
-        with col2:
-            st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-label">真表面積 (Surface Area)</div>
-                    <div class="metric-value">{area:.4f} Å²</div>
-                </div>
-            """, unsafe_allow_html=True)
-        with col3:
-            st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-label">鎖定原子數 (Fixed / Ratio)</div>
-                    <div class="metric-value">{fixed_count} / {fix_ratio}%</div>
-                </div>
-            """, unsafe_allow_html=True)
-        with col4:
-            st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-label">真空高度 (Z-Vacuum)</div>
-                    <div class="metric-value">{cell[2][2]:.2f} Å</div>
-                </div>
-            """, unsafe_allow_html=True)
-            
-        st.subheader("💾 匯出 VASP 計算檔案")
-        
-        # 建立具備 Selective Dynamics 的標準 VASP POSCAR 字串
-        poscar_io = StringIO()
-        # 利用 ASE 寫入為 VASP 格式
-        ase.io.write(poscar_io, slab, format="vasp", vasp5=True, direct=True)
-        poscar_str = poscar_io.getvalue()
-        
-        # 注入 Selective Dynamics 標記
-        lines = poscar_str.split('\n')
-        modified_poscar = []
-        
-        for idx, line in enumerate(lines):
-            if idx == 7:
-                modified_poscar.append(line)
-                modified_poscar.append("Selective dynamics")
-            elif idx >= 8 and len(line.strip().split()) >= 3:
-                # 取得該原子對應的 constraint
-                atom_idx = idx - 8
-                if atom_idx < len(constraints):
-                    c = constraints[atom_idx]
-                    tag = "T  T  T" if c == [True, True, True] else "F  F  F"
-                    # 將座標與約束標籤合併
-                    parts = line.strip().split()
-                    coords = f"  {float(parts[0]):.10f}  {float(parts[1]):.10f}  {float(parts[2]):.10f}"
-                    modified_poscar.append(f"{coords}   {tag}")
-                else:
-                    modified_poscar.append(line)
-            else:
-                modified_poscar.append(line)
-                
-        final_poscar = '\n'.join(modified_poscar)
-        
-        # 下載按鈕
-        st.download_button(
-            label="📥 下載標準 POSCAR (含 Selective Dynamics)",
-            data=final_poscar,
-            file_name=f"POSCAR_{h}{k}{l}_{layers}L",
-            mime="text/plain"
-        )
-        
-        st.code(final_poscar[:1000] + "\n\n... (後續座標已省略) ...", language="text")
+    if st.sidebar.button("🗑️ 清空所有工作區", type="secondary", use_container_width=True):
+        st.session_state.workspaces = []
+        st.rerun()
 
-    except Exception as e:
-        st.error(f"❌ 解析出錯：{str(e)}")
-        st.info("請檢查上傳的檔案內容是否為標準的 POSCAR 或 CIF 格式。")
+# --- 主畫面：分頁管理 ---
+if st.session_state.workspaces:
+    clean_titles = [f"{ws['name']} - ({ws['hkl']})" for ws in st.session_state.workspaces]
+    tabs = st.tabs(clean_titles)
 
+    for i, tab in enumerate(tabs):
+        with tab:
+            ws = st.session_state.workspaces[i]
+            
+            c1, c2 = st.columns(2)
+            show_bonds = c1.checkbox("🔗 實體金屬鍵 (Ball-and-stick)", value=True, key=f"b_{i}")
+            show_box = c2.checkbox("📦 銳利晶界框線 (Unit Cell)", value=True, key=f"box_{i}")
+            
+            # --- 💎 3D 視覺化 (修復重複出框與原子隱形 Bug 版) ---
+            view = py3Dmol.view(width=700, height=450)
+            view.addModel(ws["poscar"], 'vasp')
+            
+            style = {
+                'sphere': {
+                    'colorscheme': 'Jmol', 
+                    'scale': 0.30, 
+                    'outline': {'color': '#333333', 'width': 0.04}
+                }
+            }
+            if show_bonds: 
+                style['stick'] = {
+                    'colorscheme': 'Jmol', 
+                    'radius': 0.10
+                }
+            view.setStyle(style)
+            
+            if show_box: 
+                view.addUnitCell({'color': '#444444', 'linewidth': 1.5})
+                
+            view.setBackgroundColor('#F8F9FA') 
+            view.zoomTo()
+            
+            # 🚀 唯一被允許存在的主畫面繪圖指令，杜絕多圖框幽靈
+            showmol(view, height=450, width=700)
+            
+            st.subheader("📊 結構資訊摘要")
+            st.table(ws["summary"])
+            
+            col_act1, col_act2 = st.columns([0.5, 0.5])
+            with col_act1:
+                single_zip = io.BytesIO()
+                with zipfile.ZipFile(single_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+                    folder_name = f"{ws['name']}_{ws['hkl']}_output/"
+                    
+                    zf.writestr(f"{folder_name}POSCAR", ws["poscar"])
+                    zf.writestr(f"{folder_name}slab_info.txt", ws["info_txt"])
+                    zf.writestr(f"{folder_name}README_or_log.txt", ws["log_txt"])
+                    
+                html_link = create_download_link(single_zip.getvalue(), f"{ws['filename']}_output.zip", "📥 下載合規結構包 (ZIP)", is_zip=True)
+                st.markdown(html_link, unsafe_allow_html=True)
+            with col_act2:
+                st.info("💡 提示：若要關閉此結構分頁，請點擊左側側邊欄「已載入結構清單」中該結構旁邊的❌。")
+                
 else:
-    # 未上傳檔案時的導引畫面
-    st.info("💡 請在側邊欄上傳您的 Bulk 結構。系統支援無副檔名的純 VASP POSCAR 以及 CIF 格式。")
-    
-    # 畫一個精緻的技術架構示意圖
-    st.markdown("""
-        <div style="background-color: #1e293b; padding: 30px; border-radius: 12px; border: 1px solid #334155; margin-top: 20px;">
-            <h3>🛠️ Slab Builder Pro 工作原理</h3>
-            <p>1. <strong>讀取與分流</strong>：自動辨識 CIF/POSCAR 輸入，排除系統副檔名鎖定阻礙。</p>
-            <p>2. <strong>高精度切片</strong>：基於矩陣投影演算法切出緊密原子層，消除非物理真空隔離。</p>
-            <p>3. <strong>動態 Z 軸重構</strong>：以原子層實際厚度為基準動態加載置中真空，防範週期性邊緣碎屑。</p>
-            <p>4. <strong>約束寫入</strong>：依照比例自動於坐標後方寫入 <code style="color:#38bdf8;">F F F</code> 與 <code style="color:#38bdf8;">T T T</code> 第一性原理計算約束條件。</p>
-        </div>
-    """, unsafe_allow_html=True)
-```
+    st.info("請在上方上傳一或多個金屬 POSCAR 檔案，並點擊「批次新增到工作區」。")
