@@ -1,7 +1,6 @@
-streamlit
-py3Dmol
-stmol
-ase
-numpy
-ipython_genutils
+ase==3.29.0
+numpy==2.5.1
 pymatgen==2026.5.4
+spglib==2.7.0
+streamlit==1.59.2
+py3Dmol==2.5.5
