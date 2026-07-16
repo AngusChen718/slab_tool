@@ -8,39 +8,20 @@ import traceback
 from stmol import showmol
 from ase.io import write
 from ase.io.vasp import read_vasp
-from ase.build import surface
-from ase.neighborlist import neighbor_list, natural_cutoffs
+from slab_core import (
+    apply_bottom_plane_constraint,
+    build_from_bulk,
+    describe_input_cell,
+    periodic_gap_analysis,
+    prepare_existing_slab,
+    validate_slab_geometry,
+)
+
+APP_VERSION = "2026-07-16-stage1-v1"
 
 # 初始化：存放多個工作區
 if 'workspaces' not in st.session_state:
     st.session_state.workspaces = []
-
-def find_atomic_planes(atoms, tolerance=0.20):
-    """依 z 高度辨識完整原子平面，回傳由下到上的原子 index 群組。"""
-    order = np.argsort(atoms.positions[:, 2])
-    planes = []
-    for atom_index in order:
-        z = atoms.positions[atom_index, 2]
-        if not planes:
-            planes.append([int(atom_index)])
-            continue
-        current_z = np.mean(atoms.positions[planes[-1], 2])
-        if abs(z - current_z) <= tolerance:
-            planes[-1].append(int(atom_index))
-        else:
-            planes.append([int(atom_index)])
-    return planes
-
-
-def describe_input_cell(atoms):
-    lengths = atoms.cell.lengths()
-    angles = atoms.cell.angles()
-    formula = atoms.get_chemical_formula()
-    return (
-        f"{formula}；{len(atoms)} atoms；"
-        f"a/b/c = {lengths[0]:.4f}/{lengths[1]:.4f}/{lengths[2]:.4f} Å；"
-        f"α/β/γ = {angles[0]:.2f}/{angles[1]:.2f}/{angles[2]:.2f}°"
-    )
 
 # --- 🛠️ HTML 下載按鈕 ---
 def create_download_link(data, filename, button_text, is_zip=False):
@@ -92,21 +73,39 @@ st.markdown(
 )
 
 st.title("Slab Builder 研究室版 (VESTA 批次管理版) 🔬")
+st.caption(f"版本：{APP_VERSION}")
 
 # --- 側邊欄：參數設定 ---
 st.sidebar.header("⚙️ 參數設定")
-st.sidebar.markdown("**1. 晶面 (h, k, l)**")
-col1, col2, col3 = st.sidebar.columns(3)
-h = col1.number_input("h", value=1, step=1)
-k = col2.number_input("k", value=1, step=1)
-l = col3.number_input("l", value=1, step=1)
-
-layers = st.sidebar.number_input(
-    "ASE 結構重複層數",
-    value=10,
-    min_value=1,
-    help="此數值不一定等於實際原子平面數；產生後會另外計算並顯示。",
+input_mode = st.sidebar.radio(
+    "輸入處理模式",
+    ["自動判斷", "由 3D Bulk 建立新 Slab", "處理既有 Slab"],
+    help="已有真空的 slab 不可再次執行 surface()。自動判斷遇到疑似 slab 時會停止並要求確認。",
 )
+
+h = k = l = None
+layers = None
+allow_slab_as_bulk = False
+if input_mode != "處理既有 Slab":
+    st.sidebar.markdown("**1. 晶面 (h, k, l)**")
+    col1, col2, col3 = st.sidebar.columns(3)
+    h = col1.number_input("h", value=1, step=1)
+    k = col2.number_input("k", value=1, step=1)
+    l = col3.number_input("l", value=1, step=1)
+    layers = st.sidebar.number_input(
+        "ASE 結構重複層數",
+        value=10,
+        min_value=1,
+        help="此數值不一定等於實際原子平面數；產生後會另外計算並顯示。",
+    )
+    if input_mode == "由 3D Bulk 建立新 Slab":
+        allow_slab_as_bulk = st.sidebar.checkbox(
+            "進階：仍將疑似 Slab 當作 Bulk",
+            value=False,
+            help="只有確認偵測為誤判時才啟用；一般情況不建議。",
+        )
+else:
+    st.sidebar.info("既有 Slab 模式不會重新切晶面，只調整真空、表面超晶胞與固定層。")
 vacuum_total = st.sidebar.number_input(
     "週期影像間的總真空距離 (Å)",
     value=15.00,
@@ -139,72 +138,93 @@ st.sidebar.markdown("---")
 uploaded_files = st.file_uploader("上傳金屬 POSCAR (支援多檔案同時拖曳)", key="uploader", accept_multiple_files=True)
 
 if uploaded_files:
+    input_checks = []
+    for uploaded_file in uploaded_files:
+        try:
+            preview_atoms = read_vasp(
+                io.StringIO(uploaded_file.getvalue().decode("utf-8"))
+            )
+            preview_gap = periodic_gap_analysis(preview_atoms)
+            input_checks.append({
+                "檔案": uploaded_file.name,
+                "輸入晶胞": preview_atoms.get_chemical_formula(),
+                "最大週期空白": f"{preview_gap['largest_gap']:.2f} Å",
+                "判定": (
+                    "疑似既有 Slab"
+                    if preview_gap["likely_slab"]
+                    else "可作為 3D Bulk 候選"
+                ),
+            })
+        except Exception as exc:
+            input_checks.append({
+                "檔案": uploaded_file.name,
+                "輸入晶胞": "讀取失敗",
+                "最大週期空白": "—",
+                "判定": str(exc),
+            })
+    st.subheader("輸入結構預檢")
+    st.dataframe(input_checks, use_container_width=True, hide_index=True)
+
     if st.button("➕ 批次新增到工作區", type="primary"):
         for uploaded_file in uploaded_files:
             try:
-                stringio = io.StringIO(uploaded_file.getvalue().decode("utf-8"))
-                bulk = read_vasp(stringio)
-                
-                input_description = describe_input_cell(bulk)
-                
-                if (h, k, l) == (0, 0, 0):
-                    raise ValueError("Miller index 不可為 (0, 0, 0)")
+                input_text = uploaded_file.getvalue().decode("utf-8")
+                source_atoms = read_vasp(io.StringIO(input_text))
+                input_description = describe_input_cell(source_atoms)
+                input_gap = periodic_gap_analysis(source_atoms)
 
-                # vacuum_total 是週期影像之間的總真空；ASE 的 vacuum 參數是單側厚度。
-                # 下載用結構不因 Viewer 需求而 wrap、平移或複製。
-                slab = surface(
-                    bulk,
-                    (h, k, l),
-                    layers=layers,
-                    vacuum=vacuum_total / 2.0,
-                )
-                if super_x > 1 or super_y > 1:
-                    slab = slab * (super_x, super_y, 1)
+                if input_mode == "自動判斷":
+                    if input_gap["likely_slab"]:
+                        raise ValueError(
+                            f"偵測到約 {input_gap['largest_gap']:.2f} Å 的週期空白，"
+                            "輸入可能已是 slab。請改選『處理既有 Slab』；"
+                            "若要建立新晶面，請改上傳 3D bulk conventional cell。"
+                        )
+                    effective_mode = "bulk"
+                elif input_mode == "由 3D Bulk 建立新 Slab":
+                    if input_gap["likely_slab"] and not allow_slab_as_bulk:
+                        raise ValueError(
+                            f"輸入含約 {input_gap['largest_gap']:.2f} Å 大空白，"
+                            "已阻止 slab 再次切割。只有確認偵測誤判時才啟用進階覆寫。"
+                        )
+                    effective_mode = "bulk"
+                else:
+                    effective_mode = "existing_slab"
 
-                # 依實際 z 高度辨識原子平面。ASE layers 對含多個 basis atoms
-                # 的 conventional cell 不一定等於使用者直覺上的原子平面數。
-                atomic_planes = find_atomic_planes(slab)
-                actual_plane_count = len(atomic_planes)
-                requested_fixed_planes = int(fixed_bottom_planes)
-                applied_fixed_planes = min(
-                    requested_fixed_planes,
-                    max(actual_plane_count - 1, 0),
+                if effective_mode == "bulk":
+                    slab, reduced_hkl = build_from_bulk(
+                        source_atoms,
+                        (h, k, l),
+                        layers,
+                        vacuum_total,
+                        (super_x, super_y),
+                    )
+                    hkl_display = f"({reduced_hkl[0]}, {reduced_hkl[1]}, {reduced_hkl[2]})"
+                    hkl_key = "".join(str(v) for v in reduced_hkl)
+                    workflow_description = (
+                        f"由 3D bulk 沿 {hkl_display} 切割；"
+                        f"ASE 結構重複層數 {layers}"
+                    )
+                else:
+                    slab = prepare_existing_slab(
+                        source_atoms,
+                        vacuum_total,
+                        (super_x, super_y),
+                    )
+                    hkl_display = "沿用既有 Slab"
+                    hkl_key = "existing"
+                    workflow_description = "沿用既有 slab；未重新執行 surface()"
+
+                atomic_planes, applied_fixed_planes, fixed_indices = (
+                    apply_bottom_plane_constraint(slab, fixed_bottom_planes)
                 )
-                fixed_indices = sorted(
-                    atom_index
-                    for plane in atomic_planes[:applied_fixed_planes]
-                    for atom_index in plane
-                )
-                
-                # --- 結構體檢優化：距離 < 0.6*(Ri+Rj) 視為重疊 ---
-                overlap_cutoffs = natural_cutoffs(slab, mult=0.6)
-                i_over, j_over, d_over = neighbor_list('ijd', slab, cutoff=overlap_cutoffs)
-                overlaps = [dist for idx_i, idx_j, dist in zip(i_over, j_over, d_over) if idx_i != idx_j]
+                geometry = validate_slab_geometry(slab, planes=atomic_planes)
+                overlap = geometry["overlap"]
                 health_status = (
                     "✅ 未發現嚴重原子重疊"
-                    if len(overlaps) == 0
+                    if not overlap["has_overlap"]
                     else "⚠️ 發現疑似嚴重原子重疊"
                 )
-
-                # 用較大的鄰居搜尋範圍取得最短週期原子距離；這是一項
-                # 可量化的檢查，不把它誇大為整體物理正確性認證。
-                _, _, validation_distances = neighbor_list(
-                    "ijd", slab, cutoff=natural_cutoffs(slab, mult=2.0)
-                )
-                min_distance = (
-                    float(np.min(validation_distances))
-                    if len(validation_distances) > 0
-                    else float("nan")
-                )
-                
-                # Selective Dynamics 邏輯
-                z_positions = slab.positions[:, 2]
-                z_min, z_max = np.min(z_positions), np.max(z_positions)
-                z_range = z_max - z_min if (z_max - z_min) > 0 else 1.0
-                
-                from ase.constraints import FixAtoms
-                if fixed_indices:
-                    slab.set_constraint(FixAtoms(indices=fixed_indices))
                 
                 out_buffer = io.StringIO()
                 write(out_buffer, slab, format="vasp", vasp5=True)
@@ -223,11 +243,11 @@ if uploaded_files:
                 import datetime
                 current_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 
-                # 1. 嚴格依照 PDF 第 8 頁格式
                 info_content = f"""Input file: {uploaded_file.name}
-Miller index: ({h}, {k}, {l})
-ASE structure layers: {layers}
-Actual atomic planes: {actual_plane_count}
+Input mode: {effective_mode}
+Surface: {hkl_display}
+ASE structure layers: {layers if layers is not None else 'not applied'}
+Actual atomic planes: {geometry['plane_count']}
 Total vacuum gap: {vacuum_total} Å (approximately {vacuum_total / 2:.2f} Å per side)
 Supercell: {super_x} x {super_y} x 1
 Output file: POSCAR
@@ -242,50 +262,44 @@ Date: {current_date}
 本結果由網頁端工具自動化流水線產生。
 1. 讀取原始結構: {uploaded_file.name}
    - 輸入晶胞: {input_description}
-2. 切割晶面: 沿著 ({h}, {k}, {l}) 方向，ASE 結構重複層數為 {layers}。
-   - 實際辨識原子平面數: {actual_plane_count}
-3. 增加真空層: 週期影像間總真空約 {vacuum_total} Å（上下各約 {vacuum_total / 2:.2f} Å）。
+   - 輸入最大週期空白: {input_gap['largest_gap']:.4f} Å
+2. 結構處理: {workflow_description}
+   - 實際辨識原子平面數: {geometry['plane_count']}
+3. 設定真空層: 輸出週期影像間實測空白 {geometry['vacuum_gap']:.4f} Å。
 4. 擴張表面積: 建立 {super_x}x{super_y}x1 Supercell。
 5. Selective Dynamics (底層固定):
    - 固定底部 {applied_fixed_planes} 個完整原子平面，共 {len(fixed_indices)} 個原子。
 6. 幾何檢查:
    - {health_status}
-   - 最短週期原子距離: {min_distance:.4f} Å
+   - 最短週期原子距離: {geometry['minimum_distance']:.4f} Å
+   - Slab 厚度: {geometry['slab_thickness']:.4f} Å
 --------------------------------------------------
 """
-                
-                # --- 幾何物理計算優化 ---
-                # 表面積改為向量叉積 (支援非正交晶胞)
-                cross_prod = np.cross(slab.cell[0], slab.cell[1])
-                true_area = np.linalg.norm(cross_prod)
-                
-                # 真空比例改為真實物理真空空間
-                # 晶胞沿表面法向的高度：體積 / 表面積，也適用於傾斜晶胞。
-                total_height = abs(slab.get_volume()) / true_area if true_area > 0 else 0
-                slab_thickness = z_max - z_min
-                actual_vacuum = total_height - slab_thickness
-                vacuum_ratio = (actual_vacuum / total_height) * 100 if total_height > 0 else 0
-                
+
                 num_fixed = len(fixed_indices)
                 num_relaxed = len(slab) - num_fixed
                 
                 summary = {
                     "輸入晶胞": input_description,
-                    "晶面 (hkl)": f"({h}, {k}, {l})",
-                    "ASE 結構重複層數": layers,
-                    "實際原子平面數": actual_plane_count,
+                    "輸入判定": "疑似既有 Slab" if input_gap["likely_slab"] else "3D Bulk 候選",
+                    "處理方式": workflow_description,
+                    "晶面 (hkl)": hkl_display,
+                    "ASE 結構重複層數": layers if layers is not None else "未套用",
+                    "實際原子平面數": geometry["plane_count"],
                     "每個平面原子數": ", ".join(str(len(p)) for p in atomic_planes),
                     "Supercell": f"{super_x}x{super_y}x1",
                     "原子總數": f"{len(slab)} (固定: {num_fixed} / 放鬆: {num_relaxed})",
                     "固定完整平面數": applied_fixed_planes,
-                    "最短週期原子距離": f"{min_distance:.4f} Å",
-                    "表面積": f"{round(true_area, 2)} Å²",
-                    "真空層佔比": f"{round(vacuum_ratio, 1)}% ({round(actual_vacuum, 2)} Å)"
+                    "最短週期原子距離": f"{geometry['minimum_distance']:.4f} Å",
+                    "Slab 厚度": f"{geometry['slab_thickness']:.4f} Å",
+                    "表面積": f"{geometry['surface_area']:.2f} Å²",
+                    "實測總真空": f"{geometry['vacuum_gap']:.4f} Å",
                 }
                 
                 new_ws = {
                     "name": uploaded_file.name.split('.')[0],
-                    "filename": f"POSCAR_{uploaded_file.name.split('.')[0]}_{h}{k}{l}",
+                    "filename": f"POSCAR_{uploaded_file.name.split('.')[0]}_{hkl_key}",
+                    "input_poscar": input_text,
                     "poscar": poscar_data,
                     "viewer_xyz": viewer_xyz,
                     "viewer_cell": np.asarray(slab.cell).tolist(),
@@ -294,7 +308,7 @@ Date: {current_date}
                     "log_txt": log_content,    
                     "summary": summary,
                     "health": health_status,
-                    "hkl": f"{h}{k}{l}"
+                    "hkl": hkl_key,
                 }
                 st.session_state.workspaces.append(new_ws)
             except Exception as e:
@@ -325,6 +339,7 @@ if st.session_state.workspaces:
                 ws = st.session_state.workspaces[idx]
                 folder_name = f"{ws['name']}_{ws['hkl']}_output/"
                 
+                zip_file.writestr(f"{folder_name}input_POSCAR", ws.get("input_poscar", ""))
                 zip_file.writestr(f"{folder_name}POSCAR", ws["poscar"])
                 zip_file.writestr(f"{folder_name}slab_info.txt", ws["info_txt"])
                 zip_file.writestr(f"{folder_name}README_or_log.txt", ws["log_txt"])
@@ -346,9 +361,14 @@ if st.session_state.workspaces:
         with tab:
             ws = st.session_state.workspaces[i]
             
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             show_bonds = c1.checkbox("🔗 實體金屬鍵 (Ball-and-stick)", value=True, key=f"b_{i}")
             show_box = c2.checkbox("📦 銳利晶界框線 (Unit Cell)", value=True, key=f"box_{i}")
+            view_orientation = c3.selectbox(
+                "觀看方向",
+                ["立體", "俯視", "側視"],
+                key=f"orientation_{i}",
+            )
             
             # --- 💎 3D 視覺化 (修復重複出框與原子隱形 Bug 版) ---
             view = py3Dmol.view(width=700, height=450)
@@ -418,6 +438,17 @@ if st.session_state.workspaces:
                 
             view.setBackgroundColor('#F8F9FA') 
             view.zoomTo()
+            if view_orientation == "俯視":
+                # surface() 的表面法向為 z；identity quaternion 沿 z 俯視。
+                view.setView([0, 0, 0, 0, 0, 0, 0, 1])
+                view.zoomTo()
+            elif view_orientation == "側視":
+                view.setView([0, 0, 0, 0, 0, 0, 0, 1])
+                view.rotate(90, "x")
+                view.zoomTo()
+            else:
+                view.rotate(-55, "x")
+                view.rotate(30, "z")
             
             # 🚀 唯一被允許存在的主畫面繪圖指令，杜絕多圖框幽靈
             showmol(view, height=450, width=700)
@@ -431,6 +462,7 @@ if st.session_state.workspaces:
                 with zipfile.ZipFile(single_zip, "w", zipfile.ZIP_DEFLATED) as zf:
                     folder_name = f"{ws['name']}_{ws['hkl']}_output/"
                     
+                    zf.writestr(f"{folder_name}input_POSCAR", ws.get("input_poscar", ""))
                     zf.writestr(f"{folder_name}POSCAR", ws["poscar"])
                     zf.writestr(f"{folder_name}slab_info.txt", ws["info_txt"])
                     zf.writestr(f"{folder_name}README_or_log.txt", ws["log_txt"])
