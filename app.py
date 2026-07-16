@@ -1,476 +1,354 @@
-import streamlit as st
-import py3Dmol
+import datetime
+import hashlib
 import io
+import json
+import re
 import zipfile
-import base64
+
 import numpy as np
-import traceback
-from stmol import showmol
-from ase.io import write
-from ase.io.vasp import read_vasp
-from slab_core import (
-    apply_bottom_plane_constraint,
-    build_from_bulk,
-    describe_input_cell,
-    periodic_gap_analysis,
-    prepare_existing_slab,
-    validate_slab_geometry,
-)
+import py3Dmol
+import streamlit as st
+import streamlit.components.v1 as components
+from ase.io import read, write
 
-APP_VERSION = "2026-07-16-stage1-v1"
+from slab_core import assess_input, classify_bulk, generate_candidates
 
-# 初始化：存放多個工作區
-if 'workspaces' not in st.session_state:
-    st.session_state.workspaces = []
 
-# --- 🛠️ HTML 下載按鈕 ---
-def create_download_link(data, filename, button_text, is_zip=False):
-    if is_zip:
-        b64 = base64.b64encode(data).decode()
-        mime = "application/zip"
-    else:
-        b64 = base64.b64encode(data.encode('utf-8')).decode()
-        mime = "text/plain"
-    
-    css = """
-    <style>
-    .custom-dl-btn {
-        background-color: #FF4B4B; color: white; padding: 0.5rem 1rem;
-        border-radius: 0.5rem; text-decoration: none; display: inline-block;
-        font-weight: 500; margin-top: 10px; text-align: center; width: 90%;
+APP_VERSION = "2026-07-17-stage1.3-v1"
+
+
+def json_default(value):
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return str(value)
+
+
+def safe_name(value):
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
+    return cleaned or "slab"
+
+
+def atoms_to_poscar(atoms):
+    buffer = io.StringIO()
+    write(buffer, atoms, format="vasp", vasp5=True, direct=False)
+    return buffer.getvalue()
+
+
+def make_package(input_text, candidate, report, settings, input_name):
+    poscar = atoms_to_poscar(candidate.atoms)
+    report_dict = report.to_dict()
+    report_json = json.dumps(
+        report_dict, ensure_ascii=False, indent=2, default=json_default
+    )
+    settings_json = json.dumps(
+        settings, ensure_ascii=False, indent=2, default=json_default
+    )
+    log = (
+        "Slab Builder Stage 1.3\n"
+        f"Generated: {datetime.datetime.now().isoformat(timespec='seconds')}\n"
+        f"Input: {input_name}\n"
+        f"Builder: {candidate.builder}\n"
+        f"Candidate: {candidate.candidate_id}\n"
+        f"Validation: {report.status}\n"
+        "This is an unrelaxed initial structure. DFT convergence is not certified.\n"
+    )
+    memory = io.BytesIO()
+    folder = safe_name(f"{input_name}_{candidate.candidate_id}") + "/"
+    with zipfile.ZipFile(memory, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(folder + "input_POSCAR", input_text)
+        archive.writestr(folder + "POSCAR", poscar)
+        archive.writestr(folder + "validation_report.json", report_json)
+        archive.writestr(folder + "generation_settings.json", settings_json)
+        archive.writestr(folder + "README_or_log.txt", log)
+    return memory.getvalue(), poscar, report_json, settings_json
+
+
+def draw_cell(view, cell, shift):
+    a, b, c = np.asarray(cell, dtype=float)
+    origin = np.asarray(shift, dtype=float)
+    corners = [
+        origin,
+        origin + a,
+        origin + b,
+        origin + c,
+        origin + a + b,
+        origin + a + c,
+        origin + b + c,
+        origin + a + b + c,
+    ]
+    edges = [
+        (0, 1), (0, 2), (0, 3), (1, 4), (1, 5), (2, 4),
+        (2, 6), (3, 5), (3, 6), (4, 7), (5, 7), (6, 7),
+    ]
+    for start_index, end_index in edges:
+        start, end = corners[start_index], corners[end_index]
+        view.addLine({
+            "start": {"x": float(start[0]), "y": float(start[1]), "z": float(start[2])},
+            "end": {"x": float(end[0]), "y": float(end[1]), "z": float(end[2])},
+            "color": "#555555",
+            "linewidth": 1.4,
+        })
+
+
+def render_atoms(atoms, widget_key, height=470):
+    controls = st.columns(3)
+    show_bonds = controls[0].checkbox("顯示鍵結", True, key=f"bonds_{widget_key}")
+    show_cell = controls[1].checkbox("顯示晶胞", True, key=f"cell_{widget_key}")
+    orientation = controls[2].selectbox(
+        "觀看方向", ["側視", "俯視", "立體"], key=f"view_{widget_key}"
+    )
+
+    display_atoms = atoms.copy()
+    shift = -0.5 * np.sum(np.asarray(display_atoms.cell), axis=0)
+    display_atoms.translate(shift)
+    display_atoms.set_pbc(False)
+    xyz_buffer = io.StringIO()
+    write(xyz_buffer, display_atoms, format="xyz")
+
+    view = py3Dmol.view(width=760, height=height)
+    view.addModel(xyz_buffer.getvalue(), "xyz")
+    style = {"sphere": {"colorscheme": "Jmol", "scale": 0.31}}
+    if show_bonds:
+        style["stick"] = {"colorscheme": "Jmol", "radius": 0.09}
+    view.setStyle(style)
+    if show_cell:
+        draw_cell(view, atoms.cell, shift)
+    view.setBackgroundColor("#F8F9FA")
+    view.zoomTo()
+    view.setView([0, 0, 0, 0, 0, 0, 0, 1])
+    if orientation == "側視":
+        view.rotate(90, "x")
+    elif orientation == "立體":
+        view.rotate(-55, "x")
+        view.rotate(30, "z")
+    view.zoomTo()
+    # Embed py3Dmol directly.  This avoids stmol's legacy Jupyter dependency
+    # chain, which can fail on a clean Streamlit deployment.
+    components.html(view._make_html(), height=height, width=780, scrolling=False)
+
+
+def report_table(report):
+    metrics = report.metrics
+    rows = {
+        "驗證狀態": report.status,
+        "Builder": metrics.get("builder"),
+        "原子數": metrics.get("atom_count"),
+        "實際原子平面": metrics.get("atomic_plane_count"),
+        "每層原子數": metrics.get("atoms_per_plane"),
+        "Slab 厚度": f"{metrics.get('slab_thickness_A', 0):.4f} Å",
+        "實測總真空": f"{metrics.get('vacuum_A', 0):.4f} Å",
+        "最短週期距離": f"{metrics.get('minimum_distance_A', 0):.4f} Å",
+        "表面積": f"{metrics.get('surface_area_A2', 0):.4f} Å²",
+        "底面組成": metrics.get("bottom_composition"),
+        "頂面組成": metrics.get("top_composition"),
+        "固定平面／原子": (
+            f"{metrics.get('fixed_plane_count', 0)} / "
+            f"{metrics.get('fixed_atom_count', 0)}"
+        ),
     }
-    .custom-dl-btn:hover { background-color: #FF6666; color: white; }
-    </style>
-    """
-    return f'{css}<a href="data:{mime};base64,{b64}" download="{filename}" class="custom-dl-btn">{button_text}</a>'
+    st.table(rows)
+    for error in report.errors:
+        st.error(error)
+    for warning in report.warnings:
+        st.warning(warning)
 
-# --- 🛠️ 注入 CSS 讓分頁中的「X」按鈕變好看 ---
-st.markdown(
-    """
-    <style>
-        div.stTabs [data-testid="stMarkdownContainer"] button {
-            background-color: transparent !important;
-            border: none !important;
-            color: #AAAAAA !important;
-            cursor: pointer;
-            font-size: 14px !important;
-            font-weight: normal !important;
-            margin-left: 8px !important;
-            padding: 2px 5px !important;
-            vertical-align: middle;
-        }
-        div.stTabs [data-testid="stMarkdownContainer"] button:hover {
-            background-color: #FFDDDD !important;
-            border-radius: 4px;
-            color: #FF4B4B !important;
-        }
-        div.stTabs [aria-selected="true"] button {
-            color: #555555 !important;
-        }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
-st.title("Slab Builder 研究室版 (VESTA 批次管理版) 🔬")
-st.caption(f"版本：{APP_VERSION}")
+st.set_page_config(page_title="Slab Builder Stage 1.3", layout="wide")
+st.title("Slab Builder — Physical Validation Edition")
+st.caption(f"版本：{APP_VERSION}｜驗證失敗的候選不可下載")
 
-# --- 側邊欄：參數設定 ---
-st.sidebar.header("⚙️ 參數設定")
-input_mode = st.sidebar.radio(
+if "workspaces" not in st.session_state:
+    st.session_state.workspaces = []
+if "pending" not in st.session_state:
+    st.session_state.pending = None
+
+st.sidebar.header("參數設定")
+mode_label = st.sidebar.radio(
     "輸入處理模式",
     ["自動判斷", "由 3D Bulk 建立新 Slab", "處理既有 Slab"],
-    help="已有真空的 slab 不可再次執行 surface()。自動判斷遇到疑似 slab 時會停止並要求確認。",
 )
+mode_map = {
+    "自動判斷": "auto",
+    "由 3D Bulk 建立新 Slab": "bulk",
+    "處理既有 Slab": "existing_slab",
+}
+input_mode = mode_map[mode_label]
 
-h = k = l = None
-layers = None
-allow_slab_as_bulk = False
-if input_mode != "處理既有 Slab":
-    st.sidebar.markdown("**1. 晶面 (h, k, l)**")
-    col1, col2, col3 = st.sidebar.columns(3)
-    h = col1.number_input("h", value=1, step=1)
-    k = col2.number_input("k", value=1, step=1)
-    l = col3.number_input("l", value=1, step=1)
-    layers = st.sidebar.number_input(
-        "ASE 結構重複層數",
-        value=10,
-        min_value=1,
-        help="此數值不一定等於實際原子平面數；產生後會另外計算並顯示。",
-    )
-    if input_mode == "由 3D Bulk 建立新 Slab":
-        allow_slab_as_bulk = st.sidebar.checkbox(
-            "進階：仍將疑似 Slab 當作 Bulk",
-            value=False,
-            help="只有確認偵測為誤判時才啟用；一般情況不建議。",
-        )
-else:
-    st.sidebar.info("既有 Slab 模式不會重新切晶面，只調整真空、表面超晶胞與固定層。")
+h = k = l = 0
+if input_mode != "existing_slab":
+    st.sidebar.markdown("**Miller index**")
+    cols = st.sidebar.columns(3)
+    h = cols[0].number_input("h", value=1, step=1)
+    k = cols[1].number_input("k", value=1, step=1)
+    l = cols[2].number_input("l", value=1, step=1)
+
+atomic_layers = st.sidebar.number_input(
+    "標準金屬：實際原子層數", min_value=2, value=4, step=1
+)
+min_slab_size = st.sidebar.number_input(
+    "一般材料：最小 Slab 厚度 (Å)", min_value=3.0, value=10.0, step=1.0
+)
 vacuum_total = st.sidebar.number_input(
-    "週期影像間的總真空距離 (Å)",
-    value=15.00,
-    min_value=0.1,
-    help="ASE 會把此數值的一半放在 slab 上方、另一半放在下方。",
+    "週期影像間總真空 (Å)", min_value=5.0, value=15.0, step=1.0
 )
-st.sidebar.caption(
-    f"目前設定：上下各約 {vacuum_total / 2:.2f} Å，總真空約 {vacuum_total:.2f} Å。"
+super_cols = st.sidebar.columns(2)
+super_x = super_cols[0].number_input("X 倍數", min_value=1, value=3)
+super_y = super_cols[1].number_input("Y 倍數", min_value=1, value=3)
+fixed_planes = st.sidebar.number_input(
+    "固定底部完整平面", min_value=0, value=2, step=1
 )
+allow_override = False
+if input_mode == "bulk":
+    allow_override = st.sidebar.checkbox("進階：忽略疑似 Slab 警告", False)
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("**2. 擴張表面積 (Supercell)**")
-col_s1, col_s2 = st.sidebar.columns(2)
-super_x = col_s1.number_input("X 倍數", value=3, min_value=1)
-super_y = col_s2.number_input("Y 倍數", value=3, min_value=1)
+uploaded = st.file_uploader("上傳 POSCAR", type=None, accept_multiple_files=False)
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("**3. 🚀 Selective Dynamics 設定**")
-fixed_bottom_planes = st.sidebar.number_input(
-    "固定底部原子平面數",
-    value=4,
-    min_value=0,
-    step=1,
-    help="程式會辨識原子平面並整層固定，不會把同一層切成固定與放鬆兩部分。",
-)
-
-st.sidebar.markdown("---")
-
-# --- 主程式：上傳區 ---
-uploaded_files = st.file_uploader("上傳金屬 POSCAR (支援多檔案同時拖曳)", key="uploader", accept_multiple_files=True)
-
-if uploaded_files:
-    input_checks = []
-    for uploaded_file in uploaded_files:
-        try:
-            preview_atoms = read_vasp(
-                io.StringIO(uploaded_file.getvalue().decode("utf-8"))
-            )
-            preview_gap = periodic_gap_analysis(preview_atoms)
-            input_checks.append({
-                "檔案": uploaded_file.name,
-                "輸入晶胞": preview_atoms.get_chemical_formula(),
-                "最大週期空白": f"{preview_gap['largest_gap']:.2f} Å",
-                "判定": (
-                    "疑似既有 Slab"
-                    if preview_gap["likely_slab"]
-                    else "可作為 3D Bulk 候選"
+source_atoms = None
+source_text = None
+route_preview = None
+request_signature = None
+if uploaded is not None:
+    try:
+        source_text = uploaded.getvalue().decode("utf-8")
+        source_atoms = read(io.StringIO(source_text), format="vasp")
+        signature_payload = {
+            "source": source_text,
+            "input_mode": input_mode,
+            "hkl": [h, k, l],
+            "atomic_layers": atomic_layers,
+            "min_slab_size": min_slab_size,
+            "vacuum_total": vacuum_total,
+            "supercell": [super_x, super_y],
+            "fixed_planes": fixed_planes,
+            "allow_override": allow_override,
+        }
+        request_signature = hashlib.sha256(
+            json.dumps(signature_payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        if (
+            st.session_state.pending is not None
+            and st.session_state.pending.get("request_signature")
+            != request_signature
+        ):
+            st.session_state.pending = None
+        assessment = assess_input(source_atoms)
+        preview = {
+            "化學式": assessment["formula"],
+            "原子數": assessment["atom_count"],
+            "最大 c 向週期空白": f"{assessment['c_gap_A']:.4f} Å",
+            "輸入判定": "疑似既有 Slab" if assessment["likely_slab"] else "3D Bulk 候選",
+        }
+        if input_mode != "existing_slab":
+            route_preview = classify_bulk(source_atoms, (h, k, l))
+            preview.update({
+                "空間群": (
+                    f"{route_preview['space_group_symbol']} "
+                    f"({route_preview['space_group_number']})"
+                ),
+                "建構路由": (
+                    f"ASE {route_preview['builder_key']}"
+                    if route_preview["builder_key"]
+                    else "pymatgen termination workflow"
                 ),
             })
-        except Exception as exc:
-            input_checks.append({
-                "檔案": uploaded_file.name,
-                "輸入晶胞": "讀取失敗",
-                "最大週期空白": "—",
-                "判定": str(exc),
+        st.subheader("輸入預檢")
+        st.table(preview)
+    except Exception as exc:
+        st.error(f"輸入讀取／分析失敗：{exc}")
+
+if source_atoms is not None and st.button("產生並驗證候選", type="primary"):
+    try:
+        assessment, route, results = generate_candidates(
+            source_atoms=source_atoms,
+            input_mode=input_mode,
+            hkl=(h, k, l),
+            atomic_layers=atomic_layers,
+            min_slab_size=min_slab_size,
+            vacuum_total=vacuum_total,
+            supercell=(super_x, super_y),
+            fixed_bottom_planes=fixed_planes,
+            allow_slab_as_bulk=allow_override,
+        )
+        settings = {
+            "app_version": APP_VERSION,
+            "input_mode": input_mode,
+            "hkl": [h, k, l] if input_mode != "existing_slab" else None,
+            "atomic_layers": atomic_layers,
+            "min_slab_size_A": min_slab_size,
+            "vacuum_total_A": vacuum_total,
+            "supercell": [super_x, super_y, 1],
+            "fixed_bottom_planes": fixed_planes,
+            "input_assessment": assessment,
+            "route": {key: value for key, value in route.items() if key != "conventional_structure"},
+        }
+        st.session_state.pending = {
+            "input_name": uploaded.name,
+            "input_text": source_text,
+            "results": results,
+            "settings": settings,
+            "request_signature": request_signature,
+        }
+        st.success(f"已產生 {len(results)} 個候選")
+    except Exception as exc:
+        st.session_state.pending = None
+        st.error(str(exc))
+
+if uploaded is None:
+    st.session_state.pending = None
+pending = st.session_state.pending
+if pending:
+    st.header("候選結構")
+    labels = []
+    for candidate, report in pending["results"]:
+        top = candidate.metadata.get("top_composition", {})
+        bottom = candidate.metadata.get("bottom_composition", {})
+        labels.append(
+            f"{candidate.candidate_id}｜{report.status}｜bottom {bottom}｜top {top}"
+        )
+    selected = st.selectbox("選擇 termination／候選", range(len(labels)), format_func=lambda i: labels[i])
+    candidate, report = pending["results"][selected]
+    render_atoms(candidate.atoms, f"pending_{selected}")
+    report_table(report)
+
+    if report.passed:
+        package, poscar, report_json, settings_json = make_package(
+            pending["input_text"], candidate, report,
+            pending["settings"], pending["input_name"],
+        )
+        columns = st.columns(2)
+        columns[0].download_button(
+            "下載已驗證結構包",
+            data=package,
+            file_name=safe_name(f"{pending['input_name']}_{candidate.candidate_id}.zip"),
+            mime="application/zip",
+        )
+        if columns[1].button("加入工作區"):
+            st.session_state.workspaces.append({
+                "name": f"{pending['input_name']} — {candidate.candidate_id}",
+                "poscar": poscar,
+                "package": package,
+                "report": report.to_dict(),
+                "filename": safe_name(f"{pending['input_name']}_{candidate.candidate_id}.zip"),
             })
-    st.subheader("輸入結構預檢")
-    st.dataframe(input_checks, use_container_width=True, hide_index=True)
+            st.success("已加入工作區")
+    else:
+        st.error("此候選未通過強制驗證，因此不提供 POSCAR／ZIP 下載。")
 
-    if st.button("➕ 批次新增到工作區", type="primary"):
-        for uploaded_file in uploaded_files:
-            try:
-                input_text = uploaded_file.getvalue().decode("utf-8")
-                source_atoms = read_vasp(io.StringIO(input_text))
-                input_description = describe_input_cell(source_atoms)
-                input_gap = periodic_gap_analysis(source_atoms)
-
-                if input_mode == "自動判斷":
-                    if input_gap["likely_slab"]:
-                        raise ValueError(
-                            f"偵測到約 {input_gap['largest_gap']:.2f} Å 的週期空白，"
-                            "輸入可能已是 slab。請改選『處理既有 Slab』；"
-                            "若要建立新晶面，請改上傳 3D bulk conventional cell。"
-                        )
-                    effective_mode = "bulk"
-                elif input_mode == "由 3D Bulk 建立新 Slab":
-                    if input_gap["likely_slab"] and not allow_slab_as_bulk:
-                        raise ValueError(
-                            f"輸入含約 {input_gap['largest_gap']:.2f} Å 大空白，"
-                            "已阻止 slab 再次切割。只有確認偵測誤判時才啟用進階覆寫。"
-                        )
-                    effective_mode = "bulk"
-                else:
-                    effective_mode = "existing_slab"
-
-                if effective_mode == "bulk":
-                    slab, reduced_hkl = build_from_bulk(
-                        source_atoms,
-                        (h, k, l),
-                        layers,
-                        vacuum_total,
-                        (super_x, super_y),
-                    )
-                    hkl_display = f"({reduced_hkl[0]}, {reduced_hkl[1]}, {reduced_hkl[2]})"
-                    hkl_key = "".join(str(v) for v in reduced_hkl)
-                    workflow_description = (
-                        f"由 3D bulk 沿 {hkl_display} 切割；"
-                        f"ASE 結構重複層數 {layers}"
-                    )
-                else:
-                    slab = prepare_existing_slab(
-                        source_atoms,
-                        vacuum_total,
-                        (super_x, super_y),
-                    )
-                    hkl_display = "沿用既有 Slab"
-                    hkl_key = "existing"
-                    workflow_description = "沿用既有 slab；未重新執行 surface()"
-
-                atomic_planes, applied_fixed_planes, fixed_indices = (
-                    apply_bottom_plane_constraint(slab, fixed_bottom_planes)
-                )
-                geometry = validate_slab_geometry(slab, planes=atomic_planes)
-                overlap = geometry["overlap"]
-                health_status = (
-                    "✅ 未發現嚴重原子重疊"
-                    if not overlap["has_overlap"]
-                    else "⚠️ 發現疑似嚴重原子重疊"
-                )
-                
-                out_buffer = io.StringIO()
-                write(out_buffer, slab, format="vasp", vasp5=True)
-                poscar_data = out_buffer.getvalue()
-
-                # Viewer 使用獨立、無週期的 XYZ 副本，避免 py3Dmol 依 VASP
-                # 晶胞推斷跨週期鍵結或顯示重複影像。只改畫面，不改 POSCAR。
-                viewer_slab = slab.copy()
-                viewer_shift = -0.5 * np.sum(np.asarray(slab.cell), axis=0)
-                viewer_slab.translate(viewer_shift)
-                viewer_slab.set_pbc(False)
-                viewer_buffer = io.StringIO()
-                write(viewer_buffer, viewer_slab, format="xyz")
-                viewer_xyz = viewer_buffer.getvalue()
-                
-                import datetime
-                current_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                
-                info_content = f"""Input file: {uploaded_file.name}
-Input mode: {effective_mode}
-Surface: {hkl_display}
-ASE structure layers: {layers if layers is not None else 'not applied'}
-Actual atomic planes: {geometry['plane_count']}
-Total vacuum gap: {vacuum_total} Å (approximately {vacuum_total / 2:.2f} Å per side)
-Supercell: {super_x} x {super_y} x 1
-Output file: POSCAR
-Generated by: Streamlit Slab Builder
-Package: ASE
-Date: {current_date}
-"""
-
-                # 2. 說明生成結果與體檢報告
-                log_content = f"""[LOG] Slab Generation Workflow
---------------------------------------------------
-本結果由網頁端工具自動化流水線產生。
-1. 讀取原始結構: {uploaded_file.name}
-   - 輸入晶胞: {input_description}
-   - 輸入最大週期空白: {input_gap['largest_gap']:.4f} Å
-2. 結構處理: {workflow_description}
-   - 實際辨識原子平面數: {geometry['plane_count']}
-3. 設定真空層: 輸出週期影像間實測空白 {geometry['vacuum_gap']:.4f} Å。
-4. 擴張表面積: 建立 {super_x}x{super_y}x1 Supercell。
-5. Selective Dynamics (底層固定):
-   - 固定底部 {applied_fixed_planes} 個完整原子平面，共 {len(fixed_indices)} 個原子。
-6. 幾何檢查:
-   - {health_status}
-   - 最短週期原子距離: {geometry['minimum_distance']:.4f} Å
-   - Slab 厚度: {geometry['slab_thickness']:.4f} Å
---------------------------------------------------
-"""
-
-                num_fixed = len(fixed_indices)
-                num_relaxed = len(slab) - num_fixed
-                
-                summary = {
-                    "輸入晶胞": input_description,
-                    "輸入判定": "疑似既有 Slab" if input_gap["likely_slab"] else "3D Bulk 候選",
-                    "處理方式": workflow_description,
-                    "晶面 (hkl)": hkl_display,
-                    "ASE 結構重複層數": layers if layers is not None else "未套用",
-                    "實際原子平面數": geometry["plane_count"],
-                    "每個平面原子數": ", ".join(str(len(p)) for p in atomic_planes),
-                    "Supercell": f"{super_x}x{super_y}x1",
-                    "原子總數": f"{len(slab)} (固定: {num_fixed} / 放鬆: {num_relaxed})",
-                    "固定完整平面數": applied_fixed_planes,
-                    "最短週期原子距離": f"{geometry['minimum_distance']:.4f} Å",
-                    "Slab 厚度": f"{geometry['slab_thickness']:.4f} Å",
-                    "表面積": f"{geometry['surface_area']:.2f} Å²",
-                    "實測總真空": f"{geometry['vacuum_gap']:.4f} Å",
-                }
-                
-                new_ws = {
-                    "name": uploaded_file.name.split('.')[0],
-                    "filename": f"POSCAR_{uploaded_file.name.split('.')[0]}_{hkl_key}",
-                    "input_poscar": input_text,
-                    "poscar": poscar_data,
-                    "viewer_xyz": viewer_xyz,
-                    "viewer_cell": np.asarray(slab.cell).tolist(),
-                    "viewer_shift": viewer_shift.tolist(),
-                    "info_txt": info_content,  
-                    "log_txt": log_content,    
-                    "summary": summary,
-                    "health": health_status,
-                    "hkl": hkl_key,
-                }
-                st.session_state.workspaces.append(new_ws)
-            except Exception as e:
-                traceback.print_exc()
-                st.sidebar.error(f"檔案 {uploaded_file.name} 處理失敗: {e}")
-        st.rerun()
-
-# --- 側邊欄：🗂️ 已載入結構清單 ---
-selected_indices = []
 if st.session_state.workspaces:
-    st.sidebar.markdown("### 🗂️ 已載入結構清單")
-    for idx, ws in enumerate(st.session_state.workspaces):
-        col_side1, col_side2 = st.sidebar.columns([0.85, 0.15])
-        label = f"[{ws['health']}] {ws['name']} - ({ws['hkl']})"
-        is_selected = col_side1.checkbox(label, value=True, key=f"select_side_{idx}")
-        if is_selected:
-            selected_indices.append(idx)
-        
-        if col_side2.button("❌", key=f"del_side_{idx}"):
-            st.session_state.workspaces.pop(idx)
-            st.rerun()
-            
-    st.sidebar.markdown(" ")
-    if selected_indices:
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-            for idx in selected_indices:
-                ws = st.session_state.workspaces[idx]
-                folder_name = f"{ws['name']}_{ws['hkl']}_output/"
-                
-                zip_file.writestr(f"{folder_name}input_POSCAR", ws.get("input_poscar", ""))
-                zip_file.writestr(f"{folder_name}POSCAR", ws["poscar"])
-                zip_file.writestr(f"{folder_name}slab_info.txt", ws["info_txt"])
-                zip_file.writestr(f"{folder_name}README_or_log.txt", ws["log_txt"])
-        
-        html_link = create_download_link(zip_buffer.getvalue(), "batch_slab_outputs.zip", "📦 批次下載合規資料夾 (ZIP)", is_zip=True)
-        st.sidebar.markdown(html_link, unsafe_allow_html=True)
-        st.sidebar.markdown(" ")
-    
-    if st.sidebar.button("🗑️ 清空所有工作區", type="secondary", use_container_width=True):
-        st.session_state.workspaces = []
-        st.rerun()
-
-# --- 主畫面：分頁管理 ---
-if st.session_state.workspaces:
-    clean_titles = [f"{ws['name']} - ({ws['hkl']})" for ws in st.session_state.workspaces]
-    tabs = st.tabs(clean_titles)
-
-    for i, tab in enumerate(tabs):
-        with tab:
-            ws = st.session_state.workspaces[i]
-            
-            c1, c2, c3 = st.columns(3)
-            show_bonds = c1.checkbox("🔗 實體金屬鍵 (Ball-and-stick)", value=True, key=f"b_{i}")
-            show_box = c2.checkbox("📦 銳利晶界框線 (Unit Cell)", value=True, key=f"box_{i}")
-            view_orientation = c3.selectbox(
-                "觀看方向",
-                ["立體", "俯視", "側視"],
-                key=f"orientation_{i}",
+    st.header("已驗證工作區")
+    for index, workspace in enumerate(st.session_state.workspaces):
+        with st.expander(workspace["name"], expanded=False):
+            st.json(workspace["report"])
+            st.download_button(
+                "下載",
+                data=workspace["package"],
+                file_name=workspace["filename"],
+                mime="application/zip",
+                key=f"workspace_download_{index}",
             )
-            
-            # --- 💎 3D 視覺化 (修復重複出框與原子隱形 Bug 版) ---
-            view = py3Dmol.view(width=700, height=450)
-
-            # 舊 Session 內的工作區可能尚未含 viewer_xyz；即時轉換即可，
-            # 不需要修改真正下載的 POSCAR。
-            if "viewer_xyz" not in ws:
-                old_slab = read_vasp(io.StringIO(ws["poscar"]))
-                old_shift = -0.5 * np.sum(np.asarray(old_slab.cell), axis=0)
-                old_slab.translate(old_shift)
-                old_slab.set_pbc(False)
-                old_viewer_buffer = io.StringIO()
-                write(old_viewer_buffer, old_slab, format="xyz")
-                ws["viewer_xyz"] = old_viewer_buffer.getvalue()
-                ws["viewer_cell"] = np.asarray(old_slab.cell).tolist()
-                ws["viewer_shift"] = old_shift.tolist()
-
-            view.addModel(ws["viewer_xyz"], "xyz")
-            
-            style = {
-                'sphere': {
-                    'colorscheme': 'Jmol', 
-                    'scale': 0.30, 
-                    'outline': {'color': '#333333', 'width': 0.04}
-                }
-            }
-            if show_bonds: 
-                style['stick'] = {
-                    'colorscheme': 'Jmol', 
-                    'radius': 0.10
-                }
-            view.setStyle(style)
-            
-            if show_box:
-                # XYZ 模型沒有週期性；以 12 條線獨立畫出同一個晶胞。
-                # 如此可顯示真空高度，又不會觸發週期影像或跨邊界鍵結。
-                cell = np.asarray(ws["viewer_cell"], dtype=float)
-                shift = np.asarray(ws["viewer_shift"], dtype=float)
-                origin = shift
-                a, b, c = cell
-                corners = [
-                    origin,
-                    origin + a,
-                    origin + b,
-                    origin + c,
-                    origin + a + b,
-                    origin + a + c,
-                    origin + b + c,
-                    origin + a + b + c,
-                ]
-                edges = [
-                    (0, 1), (0, 2), (0, 3),
-                    (1, 4), (1, 5),
-                    (2, 4), (2, 6),
-                    (3, 5), (3, 6),
-                    (4, 7), (5, 7), (6, 7),
-                ]
-                for start_idx, end_idx in edges:
-                    start = corners[start_idx]
-                    end = corners[end_idx]
-                    view.addLine({
-                        "start": {"x": float(start[0]), "y": float(start[1]), "z": float(start[2])},
-                        "end": {"x": float(end[0]), "y": float(end[1]), "z": float(end[2])},
-                        "color": "#444444",
-                        "linewidth": 1.5,
-                    })
-                
-            view.setBackgroundColor('#F8F9FA') 
-            view.zoomTo()
-            if view_orientation == "俯視":
-                # surface() 的表面法向為 z；identity quaternion 沿 z 俯視。
-                view.setView([0, 0, 0, 0, 0, 0, 0, 1])
-                view.zoomTo()
-            elif view_orientation == "側視":
-                view.setView([0, 0, 0, 0, 0, 0, 0, 1])
-                view.rotate(90, "x")
-                view.zoomTo()
-            else:
-                view.rotate(-55, "x")
-                view.rotate(30, "z")
-            
-            # 🚀 唯一被允許存在的主畫面繪圖指令，杜絕多圖框幽靈
-            showmol(view, height=450, width=700)
-            
-            st.subheader("📊 結構資訊摘要")
-            st.table(ws["summary"])
-            
-            col_act1, col_act2 = st.columns([0.5, 0.5])
-            with col_act1:
-                single_zip = io.BytesIO()
-                with zipfile.ZipFile(single_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-                    folder_name = f"{ws['name']}_{ws['hkl']}_output/"
-                    
-                    zf.writestr(f"{folder_name}input_POSCAR", ws.get("input_poscar", ""))
-                    zf.writestr(f"{folder_name}POSCAR", ws["poscar"])
-                    zf.writestr(f"{folder_name}slab_info.txt", ws["info_txt"])
-                    zf.writestr(f"{folder_name}README_or_log.txt", ws["log_txt"])
-                    
-                html_link = create_download_link(single_zip.getvalue(), f"{ws['filename']}_output.zip", "📥 下載合規結構包 (ZIP)", is_zip=True)
-                st.markdown(html_link, unsafe_allow_html=True)
-            with col_act2:
-                st.info("💡 提示：若要關閉此結構分頁，請點擊左側側邊欄「已載入結構清單」中該結構旁邊的❌。")
-                
-else:
-    st.info("請在上方上傳一或多個金屬 POSCAR 檔案，並點擊「批次新增到工作區」。")
+    if st.button("清空工作區"):
+        st.session_state.workspaces = []
+        st.session_state.pending = None
+        st.rerun()
