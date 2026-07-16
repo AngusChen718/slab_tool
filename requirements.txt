@@ -4,3 +4,4 @@ stmol
 ase
 numpy
 ipython_genutils
+pymatgen==2026.5.4
