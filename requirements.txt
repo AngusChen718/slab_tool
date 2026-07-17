@@ -4,3 +4,5 @@ pymatgen==2026.5.4
 spglib==2.7.0
 streamlit==1.59.2
 py3Dmol==2.5.5
+scipy==1.18.0
+
